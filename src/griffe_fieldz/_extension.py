@@ -47,7 +47,7 @@ class FieldzExtension(Extension):
         self.include_private = include_private
         self.include_inherited = include_inherited
 
-    def on_class_instance(
+    def on_class_members(
         self,
         *,
         node: ast.AST | ObjectNode,
@@ -57,7 +57,6 @@ class FieldzExtension(Extension):
     ) -> None:
         if isinstance(node, ObjectNode):
             return  # skip runtime objects
-
         if self.object_paths and cls.path not in self.object_paths:
             return  # skip objects that were not selected
 
@@ -88,9 +87,11 @@ class FieldzExtension(Extension):
         if not self.include_inherited:
             annotations = getattr(runtime_obj, "__annotations__", {})
             fields = tuple(f for f in fields if f.name in annotations)
+        from rich import print
 
         params, attrs = _fields_to_params(fields, obj.docstring, self.include_private)
-
+        if runtime_obj.__name__ == "PosteriorStandardDeviation":
+            breakpoint()
         # merge/add field info to docstring
         if params:
             for x in sections:
@@ -119,13 +120,23 @@ def _to_annotation(type_: Any, docstring: Docstring) -> str | Expr | None:
 
 def _default_repr(field: fieldz.Field) -> str | None:
     """Return a repr for a field default."""
-    if field.default is not field.MISSING:
-        return repr(field.default)
-    if (factory := field.default_factory) is not field.MISSING:
-        if len(inspect.signature(factory).parameters) == 0:
-            with suppress(Exception):
-                return repr(factory())
-        return "<dynamic>"
+    try:
+        if field.default is not field.MISSING:
+            return repr(field.default)
+        if (factory := field.default_factory) is not field.MISSING:
+            try:
+                sig = inspect.signature(factory)
+            except ValueError:
+                return repr(factory)
+            else:
+                if len(sig.parameters) == 0:
+                    with suppress(Exception):
+                        return repr(factory())
+
+            return "<dynamic>"
+    except Exception as exc:
+        logger.warning("Failed to get default repr for %s: %s", field.name, exc)
+        pass
     return None
 
 
@@ -149,6 +160,7 @@ def _fields_to_params(
                 "description": textwrap.dedent(desc).strip(),
                 "value": _default_repr(field),
             }
+
             if field.init:
                 params.append(DocstringParameter(**kwargs))
             elif include_private or not field.name.startswith("_"):
