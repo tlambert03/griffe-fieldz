@@ -191,3 +191,248 @@ def _merge(
         else:
             # otherwise, add the missing fields
             existing_section.value.append(param)  # type: ignore
+
+# ---------------------------------------------- WIP
+
+from typing import Any, TypedDict
+import fieldz
+from griffe import (
+    Class,
+    DocstringSection,
+    DocstringSectionKind,
+    Extension,
+    Kind,
+    dynamic_import,
+)
+from rich import print
+import sys
+
+if "." not in sys.path:
+    sys.path.append(".")
+
+sources = {
+    "docstring": {
+        "attributes": {
+            "attr": {
+                "name": "attr",
+                # "annotation": ExprName(name="int", parent=Class("MyClass", 4, 19)),
+                "description": "Some attribute doc\n",
+            }
+        },
+        "parameters": {},
+    },
+    "members": {
+        "attr2": {
+            "kind": "attribute",
+            "name": "attr2",
+            "lineno": 19,
+            "endlineno": 19,
+            "docstring": ...,
+            "labels": {"class-attribute", "instance-attribute"},
+            "members": {},
+            "value": "1",
+            # 'annotation': ExprName(name='int', parent=Class('MySub', 17, 20))
+        }
+    },
+}
+
+
+class AnnotationDict(TypedDict, total=False):
+    name: str
+    cls: str
+
+
+class DocsSectionDict(TypedDict, total=False):
+    name: str
+    annotation: str | dict | None
+    description: str
+    value: str | None
+
+
+class MembersDict(TypedDict, total=False):
+    kind: Kind
+    name: str
+    lineno: int
+    endlineno: int
+    docstring: dict[str, Any]
+
+
+class DocstringDict(TypedDict, total=False):
+    value: str
+    lineno: int
+    endlineno: int
+
+
+class FieldInfo(TypedDict, total=False):
+    name: str
+    type: Any
+    description: str
+    title: str
+    default: Any
+    default_factory: Any
+    repr: bool
+    hash: bool | None
+    init: bool
+    compare: bool
+    metadata: dict
+    kw_only: bool
+    frozen: bool
+
+
+class ClassInfo(TypedDict, total=False):
+    docstring: dict[DocstringSectionKind, dict[str, DocsSectionDict]]
+    members: dict[str, MembersDict]
+    fields: dict[str, fieldz.Field]
+
+
+class MergedFieldInfo(TypedDict, total=False):
+    name: str
+    field_info: DocsSectionDict
+    doc_parameter: DocsSectionDict
+    doc_attribute: DocsSectionDict
+    doc_inline: str
+    metadata_description: str
+
+
+class MyExtension(Extension):
+    def on_class_members(self, *, cls: Class, **kwargs):
+        info = get_class_info(cls)
+        print(info)
+        print(merge_class_info(info))
+        print(merge_field_info(merge_class_info(info)["attr"], {}))
+        return super().on_class_members(cls=cls, **kwargs)
+
+
+def get_class_info(cls: Class) -> ClassInfo:
+    info: ClassInfo = {}
+    if cls.docstring:
+        info["docstring"] = dump_docs(cls.docstring.parsed)
+    info["members"] = dump(cls.members)
+    runtime_obj = dynamic_import(cls.path)
+    info["fields"] = {f.name: f for f in fieldz.fields(runtime_obj)}
+    return info
+
+
+def _get_value(field: fieldz.Field) -> str:
+    if field.default is fieldz.Field.MISSING:
+        return "MISSING"
+    return field.default
+
+
+def merge_class_info(
+    info: ClassInfo, config: dict | None = None
+) -> dict[str, MergedFieldInfo]:
+    config = config or {}
+    out: dict[str, MergedFieldInfo] = {}
+    docs = info.get("docstring", {})
+    doc_params = docs.get(DocstringSectionKind.parameters, {})
+    doc_attrs = docs.get(DocstringSectionKind.attributes, {})
+    members = info.get("members", {})
+    for name, field in info["fields"].items():
+        member = members.get(name, {})
+        out[name] = {
+            "name": name,
+            "field_info": {
+                "value": _get_value(field),
+                "annotation": str(field.type),
+                "description": field.description or "",
+            },
+            "doc_parameter": doc_params.get(name, {}),
+            "doc_attribute": doc_attrs.get(name, {}),
+            "doc_inline": member.get("docstring", {}).get("value", ""),
+            "metadata_description": field.metadata.get("description", ""),
+        }
+
+    return out
+
+
+def merge_field_info(
+    field_data: MergedFieldInfo, config: dict[str, Any] | None
+) -> DocsSectionDict:
+    """
+    Merge all doc sources for a single field according to the provided config.
+
+    :param field_data: The dictionary containing merged raw info from each doc source.
+    :param config: A dictionary containing user preferences (see doc above).
+    :return: The final doc string for this field.
+    """
+    config = config or {}
+
+    # Filter out None or empty
+    # Gather possible doc strings in a dictionary keyed by source
+    doc_sources = {
+        "doc_parameter": field_data.get("doc_parameter", {}).get("description"),
+        "doc_attribute": field_data.get("doc_attribute", {}).get("description"),
+        "doc_inline": field_data.get("doc_inline"),
+        "metadata_description": field_data.get("metadata_description"),
+    }
+
+    # Filter out None or empty
+    doc_sources = {k: v for k, v in doc_sources.items() if v}
+
+    merge_strategy = config.get("doc_merge_strategy", "prefer_first")
+    doc_priority = config.get(
+        "doc_priority",
+        ["metadata_description", "doc_inline", "doc_parameter", "doc_attribute"],
+    )
+
+    final_doc: DocsSectionDict = {}
+
+    # If the user wants to combine them in some way:
+    if merge_strategy == "concatenate":
+        # Gather them in priority order, skipping missing ones
+        non_empty_docs = []
+        for source in doc_priority:
+            doc_value = doc_sources.get(source)
+            if doc_value:
+                non_empty_docs.append(doc_value.strip())
+
+        # Join them with the configured delimiter
+        delimiter = config.get("doc_delimiter", "\n\n")
+        final_doc["description"] = delimiter.join(non_empty_docs)
+
+    elif merge_strategy == "prefer_first":
+        # Just pick the first in priority order
+        for source in doc_priority:
+            doc_value = doc_sources.get(source)
+            if doc_value:
+                final_doc["description"] = doc_value.strip()
+                break
+    else:
+        # Default fallback: same as "concatenate"
+        final_doc["description"] = "\n\n".join(s for s in doc_sources.values() if s)
+
+    # Optionally show default value (if present and user wants it)
+    if config.get("show_default_values", True):
+        default_val = field_data.get("field_info", {}).get("value")
+        if default_val is not None:
+            final_doc["description"] += f"\n\n**Default value:** `{default_val}`"
+
+    return final_doc
+
+
+def dump_docs(
+    sections: list[DocstringSection],
+) -> dict[DocstringSectionKind, dict[str, DocsSectionDict]]:
+    out: dict[DocstringSectionKind, dict[str, DocsSectionDict]] = {}
+    for section in sections:
+        if isinstance(section.value, list) and all(
+            hasattr(item, "name") for item in section.value
+        ):
+            out[section.kind] = {item.name: dump(item) for item in section.value}
+        else:
+            out[section.kind] = dump(section.value)
+    return out
+
+
+def dump(obj: object, **kwargs: Any) -> Any:
+    # if isinstance(obj, DocstringParameter):
+    #     return dump(obj)
+    #     return {p.name: dump(p.value) for p in obj.value}
+    if isinstance(obj, dict):
+        return {k: dump(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [dump(v) for v in obj]
+    if hasattr(obj, "as_dict"):
+        return dump(obj.as_dict(**kwargs))
+    return obj
